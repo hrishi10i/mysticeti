@@ -49,14 +49,25 @@ impl SimulatedNetwork {
     }
 
     /// Make `leaders` equivocate in their leader rounds; `leader_count` is the cohort size.
-    pub fn with_equivocating_leaders(mut self, leaders: &[usize], leader_count: usize) -> Self {
+    /// With `blind` (coin-elected protocols, where nobody can predict the leader when blocks
+    /// are proposed) they equivocate on every own block instead.
+    pub fn with_equivocating_leaders(
+        mut self,
+        leaders: &[usize],
+        leader_count: usize,
+        blind: bool,
+    ) -> Self {
         let committee_size = self.senders.len();
         for &index in leaders {
             assert!(
                 index < committee_size,
                 "equivocating leader {index} is not in the committee"
             );
-            let equivocator = Equivocator::new(index, committee_size, leader_count);
+            let equivocator = if blind {
+                Equivocator::new_blind(index, committee_size, leader_count)
+            } else {
+                Equivocator::new(index, committee_size, leader_count)
+            };
             self.equivocators.insert(index, Arc::new(equivocator));
         }
         self

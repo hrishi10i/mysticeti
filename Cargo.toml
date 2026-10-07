@@ -30,6 +30,11 @@ simulator = { path = "crates/simulator" }
 clap = { version = "4.6", features = ["derive"] }
 color-eyre = "0.6.2"
 eyre = "0.6.8"
+# Pinned to a specific commit: fastcrypto-tbls isn't published to crates.io, so this is
+# consumed as a git dependency (the same way Sui and other MystenLabs projects do). Bump
+# the rev deliberately, not via `cargo update`.
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "ff3bcacedcc0295055012baf0c7fb2172c18e3f3" }
+fastcrypto-tbls = { git = "https://github.com/MystenLabs/fastcrypto", rev = "ff3bcacedcc0295055012baf0c7fb2172c18e3f3" }
 futures = "0.3.28"
 indoc = "2.0"
 memmap2 = "0.9.10"

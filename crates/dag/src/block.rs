@@ -35,7 +35,7 @@ use self::{
     data::Data,
     transaction::{Transaction, TransactionLocator},
 };
-use crate::crypto::{BlockDigest, CryptoEngine, CryptoVerifier, SignatureBytes};
+use crate::crypto::{BlockDigest, CryptoEngine, CryptoVerifier, SignatureBytes, coin::CoinShare};
 use crate::{
     authority::Authority,
     committee::{Committee, Stake},
@@ -53,6 +53,9 @@ pub const GENESIS_ROUND: RoundNumber = 0;
 ///
 /// **Invariant:** adding or removing fields requires updating [`CryptoEngine::sign`] and
 /// [`Block::verify`].
+///
+/// **Exception, for now:** `coin_share` is not yet part of that invariant — see its field
+/// doc comment. Folding it in is tracked follow-up work, not an oversight.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Block {
     /// The `(authority, round, digest)` triple that uniquely identifies this block. The digest
@@ -72,6 +75,16 @@ pub struct Block {
 
     /// Signature over the block content by the proposing authority.
     signature: SignatureBytes,
+
+    /// This block's share of the round's common coin (see
+    /// [`crypto::coin`](crate::crypto::coin)), once a real DKG and the block-proposal path are
+    /// wired up to produce one. `None` until then; genesis blocks and most test blocks never
+    /// carry one.
+    ///
+    /// **Not yet covered by [`BlockDigest`]/[`CryptoEngine::sign`]**: unlike every other field
+    /// here, this one is not hashed into the digest or signed yet, so it must not be relied on
+    /// for anything consensus-relevant (committer logic, leader election) until that's fixed.
+    coin_share: Option<CoinShare>,
 }
 
 impl Block {
@@ -88,10 +101,14 @@ impl Block {
             transactions: vec![],
             timestamp_ns: 0,
             signature: SignatureBytes::dummy(),
+            coin_share: None,
         })
     }
 
-    /// Create a new block, signing it with the provided crypto engine.
+    /// Create a new block, signing it with the provided crypto engine. `coin_share` is this
+    /// authority's share of the round's common coin, when it has one to offer (see
+    /// [`crypto::coin`](crate::crypto::coin)) — `None` until a real key share is wired up for
+    /// the caller.
     pub fn new(
         authority: Authority,
         round: RoundNumber,
@@ -99,6 +116,7 @@ impl Block {
         transactions: Vec<Transaction>,
         timestamp_ns: u64,
         crypto: &CryptoEngine,
+        coin_share: Option<CoinShare>,
     ) -> Self {
         let (signature, digest) =
             crypto.sign(authority, round, &includes, &transactions, timestamp_ns);
@@ -113,6 +131,7 @@ impl Block {
             transactions,
             timestamp_ns,
             signature,
+            coin_share,
         }
     }
 
@@ -134,7 +153,17 @@ impl Block {
             transactions: vec![],
             timestamp_ns: 0,
             signature: SignatureBytes::dummy(),
+            coin_share: None,
         }
+    }
+
+    /// Attach a coin share to a test block. Test-only builder, mirroring
+    /// [`with_digest`](Self::with_digest) — real blocks will get their share from the
+    /// proposal path once that's wired up (see [`crypto::coin`](crate::crypto::coin)).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_coin_share(mut self, share: CoinShare) -> Self {
+        self.coin_share = Some(share);
+        self
     }
 
     /// Override the digest of a test block. The synthetic digest of
@@ -252,6 +281,12 @@ impl Block {
     /// Timestamp as a [`Duration`] since epoch.
     pub fn timestamp(&self) -> Duration {
         Duration::from_nanos(self.timestamp_ns)
+    }
+
+    /// This block's share of the round's common coin, if it carries one yet. See the field's
+    /// doc comment on [`Block`] for what's still missing before this means anything.
+    pub fn coin_share(&self) -> Option<&CoinShare> {
+        self.coin_share.as_ref()
     }
 }
 

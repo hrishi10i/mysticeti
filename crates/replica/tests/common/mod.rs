@@ -44,6 +44,8 @@ fn open_core<C: Ctx>(
         false,
         committer,
         crypto,
+        // These integration tests don't exercise the common coin; see `dag::crypto::coin`.
+        None,
     )
 }
 

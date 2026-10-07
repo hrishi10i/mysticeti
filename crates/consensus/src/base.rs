@@ -3,8 +3,9 @@
 
 use std::{
     borrow::Borrow,
+    collections::HashMap,
     fmt::{self, Display},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -18,6 +19,7 @@ use dag::{
     committee::Stake,
     committee::{Committee, StakeAggregator},
     consensus::{DirectCommitPath, IndirectCommitPath, LeaderStatus},
+    crypto::coin,
     data::Data,
     storage::BlockReader,
 };
@@ -39,6 +41,14 @@ pub(crate) struct BaseCommitter {
     anchor_link_size: Stake,
     pub(crate) wave: Wave,
     leader_offset: RoundNumber,
+    /// Seeds already combined from a quorum of coin shares, by round. By BLS uniqueness any
+    /// quorum yields the same value, so once a round has one it never changes and the
+    /// (expensive) combination is done once per round instead of on every `elect_leader`.
+    coin_seeds: Mutex<HashMap<RoundNumber, RoundNumber>>,
+    /// Whether leaders come from the common coin (strict): a wave's leader is unknown until a
+    /// quorum of coin shares exists at the wave's decision round, and `elect_leader` returns
+    /// `None` until then. Off by default, in which case leaders are round-robin.
+    coin_election: bool,
 }
 
 impl BaseCommitter {
@@ -65,7 +75,29 @@ impl BaseCommitter {
                 protocol.merged_certificates,
             ),
             leader_offset,
+            coin_seeds: Mutex::new(HashMap::new()),
+            coin_election: false,
         }
+    }
+
+    /// Elect leaders through the common coin instead of round-robin (see `coin_election`).
+    pub(crate) fn with_coin_election(mut self) -> Self {
+        self.coin_election = true;
+        self
+    }
+
+    /// True iff `round` is a leader round whose leader is not yet known: coin election is on
+    /// and fewer than a quorum of shares exist at the wave's decision round.
+    pub(crate) fn leader_pending(&self, round: RoundNumber) -> bool {
+        self.coin_election
+            && self.wave.is_leader_round(round)
+            && self.coin_based_seed(self.coin_round(round)).is_none()
+    }
+
+    /// The round whose shares reveal the leader of leader round `round`: the last round of
+    /// its wave. An adversary cannot predict the leader before that round's blocks exist.
+    fn coin_round(&self, round: RoundNumber) -> RoundNumber {
+        self.wave.decision_round(self.wave.number(round))
     }
 
     #[cfg(test)]
@@ -110,13 +142,49 @@ impl BaseCommitter {
 
     /// The leader-elect protocol is offset by `leader_offset` to ensure that different
     /// committers with different leader offsets elect different leaders for the same round number.
-    /// This function returns `None` if there are no leaders for the specified round.
+    /// This function returns `None` if there is no leader for the specified round, or, under
+    /// coin election, if the leader is not yet known (see [`leader_pending`](Self::leader_pending)).
+    ///
+    /// Without coin election the seed is the round number (round-robin). With it, the seed is
+    /// the common coin of the wave's decision round, and there is no fallback: until a quorum of
+    /// shares exists at that round no node elects a leader, so no two nodes can disagree.
+    /// `leader_offset` still shifts which authority in the cohort this committer elects.
     pub(crate) fn elect_leader(&self, round: RoundNumber) -> Option<Authority> {
         if !self.wave.is_leader_round(round) {
             return None;
         }
+        let seed = if self.coin_election {
+            self.coin_based_seed(self.coin_round(round))?
+        } else {
+            round
+        };
         let offset = self.leader_offset as RoundNumber;
-        Some(self.leader_elector.elect_leader(round + offset))
+        Some(self.leader_elector.elect_leader(seed + offset))
+    }
+
+    /// Combine the coin shares that round `round`'s blocks carry into that round's common-coin
+    /// seed. Returns `None` when fewer than a quorum of distinct authorities have a share there
+    /// yet. One share per author: an equivocator's twin blocks carry the same share.
+    fn coin_based_seed(&self, round: RoundNumber) -> Option<RoundNumber> {
+        if let Some(seed) = self.coin_seeds.lock().unwrap().get(&round) {
+            return Some(*seed);
+        }
+        let threshold = coin::quorum_threshold(&self.committee);
+        let mut authors = std::collections::HashSet::new();
+        let shares: Vec<_> = self
+            .block_reader
+            .get_blocks_by_round(round)
+            .iter()
+            .filter(|block| block.coin_share().is_some() && authors.insert(block.author()))
+            .filter_map(|block| block.coin_share().cloned())
+            .collect();
+        if shares.len() < threshold as usize {
+            return None;
+        }
+        let combined = coin::combine(threshold, shares.into_iter()).ok()?;
+        let seed = coin::coin_seed(&combined);
+        self.coin_seeds.lock().unwrap().insert(round, seed);
+        Some(seed)
     }
 
     /// Find which block is supported at (author, round) by the given block.
@@ -460,7 +528,10 @@ mod tests {
         authority::Authority,
         block::Block,
         consensus::{DirectCommitPath, IndirectCommitPath, LeaderStatus},
-        crypto::BlockDigest,
+        crypto::{
+            BlockDigest,
+            coin::{self, mocked_committee_setup},
+        },
         data::Data,
         storage::Storage,
         test_util::{build_dag, build_dag_layer, committee, insert_test_block},
@@ -501,6 +572,119 @@ mod tests {
             committer_offset_zero.elect_leader(3),
             committer_offset_one.elect_leader(3),
         );
+    }
+
+    /// Insert a block per listed author at `round`, each carrying its share for that round.
+    fn insert_share_blocks(
+        storage: &mut Storage,
+        key_shares: &[coin::CoinKeyShare],
+        round: dag::block::RoundNumber,
+        authors: &[usize],
+    ) {
+        for &i in authors {
+            let block = Block::new_for_test(Authority::from(i as u64), round, vec![])
+                .with_coin_share(key_shares[i].sign_round(round));
+            insert_test_block(block, storage);
+        }
+    }
+
+    /// Under coin election the leader of a wave is seeded by the combined coin of the wave's
+    /// decision round (round 2 for wave length 3), not by round-robin.
+    #[test]
+    fn elect_leader_uses_coin_of_the_decision_round() {
+        let committee = committee(4);
+        let mut storage = Storage::new_for_test(&committee);
+        let key_shares = mocked_committee_setup(&committee);
+        insert_share_blocks(&mut storage, &key_shares, 2, &[0, 1, 2, 3]);
+
+        let committer =
+            BaseCommitter::new_for_test(&committee, storage.block_reader().clone(), 3, 0)
+                .with_coin_election();
+
+        let threshold = coin::quorum_threshold(&committee);
+        let shares = key_shares.iter().map(|k| k.sign_round(2));
+        let combined = coin::combine(threshold, shares).expect("quorum of shares present");
+        let expected_seed = coin::coin_seed(&combined);
+        let expected_leader = Authority::new(expected_seed % committee.len() as u64);
+
+        assert_eq!(committer.elect_leader(0), Some(expected_leader));
+        assert!(!committer.leader_pending(0));
+    }
+
+    /// Strict election: below a quorum of shares at the decision round there is no leader and
+    /// no fallback. Shares at the leader round itself reveal nothing.
+    #[test]
+    fn elect_leader_is_strict_until_the_decision_round_has_a_quorum() {
+        let committee = committee(4);
+        let mut storage = Storage::new_for_test(&committee);
+        let key_shares = mocked_committee_setup(&committee);
+
+        // A full quorum of shares at the leader round (0), but only two at the decision round.
+        insert_share_blocks(&mut storage, &key_shares, 0, &[0, 1, 2, 3]);
+        insert_share_blocks(&mut storage, &key_shares, 2, &[0, 1]);
+
+        let committer =
+            BaseCommitter::new_for_test(&committee, storage.block_reader().clone(), 3, 0)
+                .with_coin_election();
+        assert_eq!(committer.elect_leader(0), None);
+        assert!(committer.leader_pending(0));
+        // Not a leader round: not pending either.
+        assert!(!committer.leader_pending(1));
+
+        // The third share arrives: the leader becomes known.
+        insert_share_blocks(&mut storage, &key_shares, 2, &[2]);
+        assert!(committer.elect_leader(0).is_some());
+        assert!(!committer.leader_pending(0));
+    }
+
+    /// An equivocator's twin blocks carry the same share and count once, not twice.
+    #[test]
+    fn duplicate_authors_do_not_count_towards_the_coin_quorum() {
+        let committee = committee(4);
+        let mut storage = Storage::new_for_test(&committee);
+        let key_shares = mocked_committee_setup(&committee);
+        insert_share_blocks(&mut storage, &key_shares, 2, &[0, 1]);
+        // A twin of author 1's block (different transactions, same share).
+        let twin = Block::new_for_test(Authority::from(1u64), 2, vec![])
+            .with_coin_share(key_shares[1].sign_round(2))
+            .with_digest(BlockDigest::from([7u8; 32]));
+        insert_test_block(twin, &mut storage);
+
+        let committer =
+            BaseCommitter::new_for_test(&committee, storage.block_reader().clone(), 3, 0)
+                .with_coin_election();
+        assert_eq!(committer.elect_leader(0), None);
+    }
+
+    /// Once a round's coin is combined it is cached: repeated elections agree and the round
+    /// is stored once.
+    #[test]
+    fn combined_coin_is_cached_per_round() {
+        let committee = committee(4);
+        let mut storage = Storage::new_for_test(&committee);
+        let key_shares = mocked_committee_setup(&committee);
+        insert_share_blocks(&mut storage, &key_shares, 2, &[0, 1, 2, 3]);
+        let committer =
+            BaseCommitter::new_for_test(&committee, storage.block_reader().clone(), 3, 0)
+                .with_coin_election();
+        assert!(committer.coin_seeds.lock().unwrap().is_empty());
+        let first = committer.elect_leader(0);
+        assert_eq!(committer.coin_seeds.lock().unwrap().len(), 1);
+        assert_eq!(committer.elect_leader(0), first);
+        assert_eq!(committer.coin_seeds.lock().unwrap().len(), 1);
+    }
+
+    /// Without coin election leaders stay round-robin, whatever shares the blocks carry.
+    #[test]
+    fn without_coin_election_leaders_are_round_robin() {
+        let committee = committee(4);
+        let mut storage = Storage::new_for_test(&committee);
+        let key_shares = mocked_committee_setup(&committee);
+        insert_share_blocks(&mut storage, &key_shares, 2, &[0, 1, 2, 3]);
+        let committer =
+            BaseCommitter::new_for_test(&committee, storage.block_reader().clone(), 3, 0);
+        assert_eq!(committer.elect_leader(0), Some(Authority::new(0)));
+        assert!(!committer.leader_pending(0));
     }
 
     /// `find_support` returns the direct include when one points at the target slot.

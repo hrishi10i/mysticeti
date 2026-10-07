@@ -24,7 +24,7 @@ use crate::{
     committee::{Committee, Stake, StakeAggregator},
     consensus::{CommittedSubDag, DagConsensus, LeaderStatus},
     context::Ctx,
-    crypto::{CryptoEngine, CryptoVerifier},
+    crypto::{CryptoEngine, CryptoVerifier, coin::CoinKeyShare},
     data::Data,
     metrics::Metrics,
     state::RecoveredState,
@@ -48,6 +48,10 @@ pub struct Core<C: Ctx, D: DagConsensus> {
     // todo - ugly, probably need to merge syncer and core
     recovered_committed_blocks: Option<HashSet<BlockReference>>,
     committer: D,
+    /// This authority's share of the common-coin key, if it has one. `None` means proposed
+    /// blocks carry no coin share at all (today's default: no real DKG exists yet, so nothing
+    /// supplies a real share outside tests — see [`crypto::coin`](crate::crypto::coin)).
+    coin_key_share: Option<CoinKeyShare>,
 }
 
 /// One voting round watched for the fast commit quorum completing between two own
@@ -92,6 +96,7 @@ impl<C: Ctx, D: DagConsensus> Core<C, D> {
         fsync: bool,
         committer: D,
         crypto: CryptoEngine,
+        coin_key_share: Option<CoinKeyShare>,
     ) -> Self {
         let RecoveredState {
             last_own_block,
@@ -154,6 +159,7 @@ impl<C: Ctx, D: DagConsensus> Core<C, D> {
             crypto,
             recovered_committed_blocks: Some(committed_blocks),
             committer,
+            coin_key_share,
         };
 
         if !unprocessed_blocks.is_empty() {
@@ -255,6 +261,10 @@ impl<C: Ctx, D: DagConsensus> Core<C, D> {
 
         assert!(!includes.is_empty());
         let time_ns = C::timestamp_utc().as_nanos() as u64;
+        let coin_share = self
+            .coin_key_share
+            .as_ref()
+            .map(|key_share| key_share.sign_round(clock_round));
         let block = Block::new(
             self.authority,
             clock_round,
@@ -262,6 +272,7 @@ impl<C: Ctx, D: DagConsensus> Core<C, D> {
             statements,
             time_ns,
             &self.crypto,
+            coin_share,
         );
         assert_eq!(
             block.includes().first().unwrap().authority,

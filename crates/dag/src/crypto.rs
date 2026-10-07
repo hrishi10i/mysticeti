@@ -8,10 +8,13 @@
 //! for tests that don't need real cryptography.
 //!
 //! Submodules:
+//! - [`coin`]   — threshold-BLS common-coin shares (see module docs; not yet wired into
+//!   [`Block`] or leader election)
 //! - [`digest`] — block digest computation (Blake2b-256)
 //! - [`hash`]   — traits for feeding values into a running hasher
 //! - [`sign`]   — Ed25519 key and signature types
 
+pub mod coin;
 mod digest;
 mod hash;
 mod sign;

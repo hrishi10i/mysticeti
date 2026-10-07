@@ -38,6 +38,27 @@ pub struct Committer {
 
 impl Committer {
     pub fn new(committee: Arc<Committee>, block_reader: BlockReader, protocol: Protocol) -> Self {
+        Self::build(committee, block_reader, protocol, false)
+    }
+
+    /// Like [`Committer::new`], but leaders are elected through the common coin: each wave's
+    /// leader is unknown until a quorum of coin shares exists at the wave's decision round.
+    /// Every replica of a committee must make the same choice. Blocks must carry coin shares
+    /// (see `dag::crypto::coin`), or no leader is ever elected.
+    pub fn new_with_coin(
+        committee: Arc<Committee>,
+        block_reader: BlockReader,
+        protocol: Protocol,
+    ) -> Self {
+        Self::build(committee, block_reader, protocol, true)
+    }
+
+    fn build(
+        committee: Arc<Committee>,
+        block_reader: BlockReader,
+        protocol: Protocol,
+        coin_election: bool,
+    ) -> Self {
         let mut base_committers = Vec::new();
         let pipeline_stages = if protocol.pipeline {
             protocol.wave_length
@@ -55,7 +76,11 @@ impl Committer {
                     leader_offset as RoundNumber,
                     round_offset,
                 );
-                base_committers.push(committer);
+                base_committers.push(if coin_election {
+                    committer.with_coin_election()
+                } else {
+                    committer
+                });
             }
         }
 
@@ -93,6 +118,11 @@ impl Committer {
             for committer in self.base_committers.iter().rev() {
                 // Skip committers that don't have a leader for this round.
                 let Some(leader) = committer.elect_leader(round) else {
+                    // A leader that is not yet known (coin election) blocks every leader above
+                    // it: only the decided prefix may be yielded, so drop what we collected.
+                    if committer.leader_pending(round) {
+                        self.leaders.clear();
+                    }
                     continue;
                 };
                 tracing::debug!(

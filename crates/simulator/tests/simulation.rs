@@ -381,3 +381,119 @@ fn network_partition() {
 
     assert_ne!(results.outcome, Outcome::Diverged);
 }
+
+/// Run `protocol` (an asynchronous one, so leaders come from the common coin) in the simulator
+/// and return the per-replica committed-leader counts, after checking that the run passed:
+/// replicas agree and at least one leader committed.
+fn run_coin_protocol(
+    name: &str,
+    protocol: ConsensusProtocol,
+    committee_size: usize,
+    topology: NetworkTopology,
+    duration_secs: u64,
+) -> Vec<u64> {
+    let config = SimulationConfig {
+        committee_size,
+        topology,
+        duration_secs,
+        replica_parameters: ReplicaParameters {
+            consensus: protocol,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let results = SimulationRunner::new(config).run().unwrap();
+    let commits: Vec<u64> = results
+        .metrics
+        .iter()
+        .map(|m| m.total_committed_leaders())
+        .collect();
+    assert_eq!(
+        results.outcome,
+        Outcome::Pass,
+        "{name}: commits per replica {commits:?}"
+    );
+    results
+        .metrics
+        .iter()
+        .map(|m| m.total_committed_leaders())
+        .collect()
+}
+
+fn async_coin_protocols() -> Vec<(&'static str, ConsensusProtocol)> {
+    vec![
+        (
+            "mahi-mahi",
+            ConsensusProtocol::MahiMahi {
+                leader_count: NonZeroUsize::new(1).unwrap(),
+                wave_length: 4,
+            },
+        ),
+        (
+            "blue-bottle-asynchronous",
+            ConsensusProtocol::BlueBottleAsynchronous {
+                leader_count: NonZeroUsize::new(1).unwrap(),
+            },
+        ),
+        (
+            "cordial-miners-asynchronous",
+            ConsensusProtocol::CordialMinersAsynchronous,
+        ),
+    ]
+}
+
+/// Asynchronous protocols elect leaders through the coin; they must still commit.
+#[test]
+fn coin_protocols_commit() {
+    for (name, protocol) in async_coin_protocols() {
+        let commits = run_coin_protocol(name, protocol.clone(), 4, NetworkTopology::FullMesh, 20);
+        assert!(
+            commits.iter().all(|&count| count > 0),
+            "{name}: some replica committed nothing: {commits:?}"
+        );
+    }
+}
+
+/// Same seed, same coin, same commits.
+#[test]
+fn coin_protocols_are_deterministic() {
+    for (name, protocol) in async_coin_protocols() {
+        let first = run_coin_protocol(name, protocol.clone(), 4, NetworkTopology::FullMesh, 20);
+        let second = run_coin_protocol(name, protocol.clone(), 4, NetworkTopology::FullMesh, 20);
+        assert_eq!(first, second, "{name}");
+    }
+}
+
+/// With one node down a quorum of shares still exists every round. Uses n = 6: blue-bottle's
+/// 4/5 quorum is 4 of 4 at n = 4, so it tolerates no crash there, coin or not.
+#[test]
+fn coin_protocols_commit_with_one_node_down() {
+    for (name, protocol) in async_coin_protocols() {
+        let commits = run_coin_protocol(name, protocol.clone(), 6, NetworkTopology::OneDown(0), 40);
+        assert!(
+            commits.iter().skip(1).all(|&count| count > 0),
+            "{name}: {commits:?}"
+        );
+    }
+}
+
+/// A Byzantine node cannot predict the coin-elected leader when it proposes, so it equivocates
+/// on every block it makes. Honest replicas must still agree and keep committing.
+#[test]
+fn coin_protocols_survive_a_blind_equivocator() {
+    for (name, protocol) in async_coin_protocols() {
+        let config = SimulationConfig {
+            committee_size: 6,
+            duration_secs: 40,
+            equivocating_leaders: vec![1],
+            replica_parameters: ReplicaParameters {
+                consensus: protocol,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let results = SimulationRunner::new(config).run().unwrap();
+        assert_ne!(results.outcome, Outcome::Diverged, "{name}");
+        assert_eq!(results.outcome, Outcome::Pass, "{name}");
+    }
+}

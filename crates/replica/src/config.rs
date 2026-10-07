@@ -13,7 +13,10 @@ use dag::{
     authority::Authority,
     committee::{AuthorityInfo, Committee},
     config::{DagParameters, ImportExport, ReplicaIdentifier},
-    crypto::Signer,
+    crypto::{
+        Signer,
+        coin::{self, CoinKeyShare},
+    },
 };
 use rand::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
@@ -132,20 +135,32 @@ impl ImportExport for PublicReplicaConfig {}
 pub struct PrivateReplicaConfig {
     authority: Authority,
     pub keypair: Signer,
+    /// This replica's share of the common-coin key, booted next to its signing key. Used only
+    /// by protocols that elect leaders through the coin (the asynchronous ones). Configs
+    /// written before the coin existed have no such entry and load as `None`, in which case the
+    /// replica proposes without a coin share.
+    #[serde(default)]
+    pub coin_key_share: Option<CoinKeyShare>,
     pub storage_path: PathBuf,
 }
 
 impl PrivateReplicaConfig {
+    /// Deterministic benchmark configs: seeded signing keys, and coin key shares from
+    /// [`coin::mocked_setup_for_size`] (insecure, benchmark-only: the shares are derivable from
+    /// the code).
     pub fn new_for_benchmarks(working_dir: &Path, committee_size: usize) -> Vec<Self> {
         let mut rng = StdRng::seed_from_u64(0);
-        (0..committee_size)
-            .map(|i| {
+        coin::mocked_setup_for_size(committee_size)
+            .into_iter()
+            .enumerate()
+            .map(|(i, coin_key_share)| {
                 let keypair = Signer::new(&mut rng);
                 let authority = Authority::from(i);
                 let path = working_dir.join(PrivateReplicaConfig::default_storage_path(authority));
                 Self {
                     authority,
                     keypair,
+                    coin_key_share: Some(coin_key_share),
                     storage_path: path,
                 }
             })

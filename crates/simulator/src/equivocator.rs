@@ -17,6 +17,10 @@ pub(crate) struct Equivocator {
     authority: Authority,
     elector: LeaderElector,
     leader_count: u64,
+    /// Leaders come from the common coin, which nobody can know when a block is proposed (it
+    /// is revealed only at the wave's last round), so the adversary cannot single out its
+    /// leader blocks and equivocates on every own block.
+    blind: bool,
 }
 
 impl Equivocator {
@@ -26,14 +30,27 @@ impl Equivocator {
             authority: Authority::from(index),
             elector: LeaderElector::new(committee_size),
             leader_count: leader_count as u64,
+            blind: false,
+        }
+    }
+
+    /// An equivocator for coin-elected protocols: it cannot predict its leader rounds, so it
+    /// equivocates on all its blocks.
+    pub(crate) fn new_blind(index: usize, committee_size: usize, leader_count: usize) -> Self {
+        Self {
+            blind: true,
+            ..Self::new(index, committee_size, leader_count)
         }
     }
 
     /// Whether `block` is our own proposal in a round where we hold a leader slot.
     fn is_leader_block(&self, block: &Block) -> bool {
         block.author() == self.authority
-            && (0..self.leader_count)
-                .any(|offset| self.elector.elect_leader(block.round() + offset) == self.authority)
+            && (self.blind
+                || (0..self.leader_count)
+                .any(|offset| {
+                    self.elector.elect_leader(block.round() + offset) == self.authority
+                }))
     }
 
     /// The same block under a different digest (last byte flipped).
@@ -117,6 +134,14 @@ mod tests {
         assert!(equivocator.is_leader_block(&block(1, 1)));
         assert!(equivocator.is_leader_block(&block(1, 4)));
         assert!(!equivocator.is_leader_block(&block(1, 2)));
+        assert!(!equivocator.is_leader_block(&block(2, 1)));
+    }
+
+    #[test]
+    fn blind_equivocator_rewrites_every_own_block() {
+        let equivocator = Equivocator::new_blind(1, 4, 1);
+        assert!(equivocator.is_leader_block(&block(1, 1)));
+        assert!(equivocator.is_leader_block(&block(1, 2)));
         assert!(!equivocator.is_leader_block(&block(2, 1)));
     }
 

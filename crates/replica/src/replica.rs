@@ -96,6 +96,17 @@ impl Replica {
             CryptoEngine::enabled(private_config.keypair)
         };
 
+        // Common coin: only protocols that do not wait for a known leader (the asynchronous
+        // ones, `leader_wait: false`) elect their leaders through the coin. Synchronous
+        // protocols keep round-robin, so they propose without a coin share. A replica with a
+        // key share elects strictly through the coin; all replicas of a committee must be
+        // booted alike.
+        let coin_key_share = if protocol.leader_wait {
+            None
+        } else {
+            private_config.coin_key_share
+        };
+
         // Network: user-provided, or bind TCP.
         let network = match network_override {
             Some(network) => network,
@@ -120,7 +131,11 @@ impl Replica {
             .unwrap_or_else(|| protocol.default_round_timeout());
         let enable_synchronizer = parameters.dag.enable_synchronizer;
         let fsync = parameters.dag.fsync;
-        let committer = Committer::new(committee.clone(), storage.block_reader().clone(), protocol);
+        let committer = if coin_key_share.is_some() {
+            Committer::new_with_coin(committee.clone(), storage.block_reader().clone(), protocol)
+        } else {
+            Committer::new(committee.clone(), storage.block_reader().clone(), protocol)
+        };
         let core = Core::open(
             block_handler,
             authority,
@@ -131,6 +146,7 @@ impl Replica {
             fsync,
             committer,
             crypto,
+            coin_key_share,
         );
         let network_synchronizer = NetworkSyncer::start(
             network,
